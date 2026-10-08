@@ -632,6 +632,15 @@ def legacy_fused_linear_cross_entropy(
 
 
 def apply_kernel_policy(model: nn.Module, config, *, runtime_args=None) -> dict[str, Any]:
+    from dataclasses import replace
+    model_config = getattr(model, "config", None)
+    if (getattr(model_config, "tensor_model_parallel_size", 1) > 1
+        or getattr(model_config, "context_parallel_size", 1) > 1):
+        if config.qkv_layout_backend == "tp1_batch_major":
+            raise ValueError("TP1 batch-major layout cannot be used with TP/CP")
+        if config.loss_backend in {"legacy", "liger"}:
+            raise ValueError("Single-rank fused LCE cannot be used with TP/CP")
+        config = replace(config, qkv_layout_backend="megatron", loss_backend="megatron")
     enable_tp1_layout = config.kernel_policy != "off" and config.qkv_layout_backend != "megatron"
     if config.qkv_layout_backend == "auto" and config.attention_backend == "megatron":
         enable_tp1_layout = False

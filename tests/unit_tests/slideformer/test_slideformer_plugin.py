@@ -40,6 +40,14 @@ class ToyTELinear(nn.Linear):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.fuse_wgrad_accumulation = False
+        self.weight.register_hook(self._fused_wgrad_hook)
+
+    def _fused_wgrad_hook(self, grad):
+        if self.fuse_wgrad_accumulation:
+            self.weight.main_grad.copy_(grad)
+            self.weight.grad_added_to_main_grad = True
+            return torch.zeros_like(grad)
+        return grad
 
 
 class ToyMegatronModel(nn.Module):
@@ -777,12 +785,17 @@ def test_legacy_lce_matches_cross_entropy_on_cuda() -> None:
 
 
 def test_engine_checkpoint_round_trips_scheduler_state(tmp_path: Path) -> None:
-    class FakeEngine:
+    class FakeEngine(MegatronSlideFormerEngine):
         def __init__(self):
+            from types import SimpleNamespace
+            self.layout = SimpleNamespace(model=SimpleNamespace(config=None))
             self.loaded = None
 
         def state_dict(self):
             return {"engine_step": 4}
+
+        def _validate_checkpoint_model_state(self, state):
+            assert "engine_step" in state
 
         def load_state_dict(self, state):
             self.loaded = state
@@ -794,23 +807,38 @@ def test_engine_checkpoint_round_trips_scheduler_state(tmp_path: Path) -> None:
         def state_dict(self):
             return {"num_steps": 256}
 
+        def _validate_checkpoint_model_state(self, state):
+            assert "engine_step" in state
+
         def load_state_dict(self, state):
             self.loaded = state
 
     engine = FakeEngine()
     scheduler = FakeScheduler()
 
+    saved_rng = torch.get_rng_state().clone()
     path = MegatronSlideFormerEngine.save_checkpoint(
         engine, tmp_path, 4, opt_param_scheduler=scheduler
     )
+    torch.manual_seed(997)
     iteration = MegatronSlideFormerEngine.load_checkpoint(
         engine, tmp_path, opt_param_scheduler=scheduler
     )
 
     assert path == tmp_path / "slideformer" / "iter_0000004.pt"
     assert iteration == 4
+    assert torch.equal(torch.get_rng_state(), saved_rng)
     assert engine.loaded == {"engine_step": 4}
     assert scheduler.loaded == {"num_steps": 256}
+
+    latest = tmp_path / "slideformer" / "latest.pt"
+    payload = torch.load(latest, weights_only=False)
+    payload["parallel_topology"]["context_parallel_size"] = 2
+    torch.save(payload, latest)
+    engine.loaded = None
+    with pytest.raises(ValueError, match="parallel topology mismatch"):
+        engine.load_checkpoint(tmp_path)
+    assert engine.loaded is None
 
 
 def test_layout_resolves_gpt_like_structure() -> None:
@@ -1064,3 +1092,72 @@ def test_slideformer_checkpoint_round_trip() -> None:
         engine.close()
         if restored_engine is not None:
             restored_engine.close()
+
+
+def test_router_te_gemm_casts_mixed_dtype_inputs(monkeypatch):
+    from megatron.core.transformer.moe import moe_utils
+
+    def gemm(a, b, dtype, *, layout, bias=None, grad=False):
+        assert a.dtype == b.dtype == dtype
+        assert bias is None or bias.dtype == dtype
+        if layout == "TN":
+            output = b @ a.t()
+        elif layout == "NN":
+            output = b @ a
+        else:
+            assert layout == "NT"
+            output = b.t() @ a
+        if bias is not None:
+            output = output + bias
+        return output, None, None, None
+
+    monkeypatch.setattr(moe_utils, "te_general_gemm", gemm)
+    inputs = torch.randn(2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(4, 8, dtype=torch.float32, requires_grad=True)
+    bias = torch.randn(4, dtype=torch.float32, requires_grad=True)
+    output = moe_utils.router_gating_linear(inputs, weight, bias, torch.float32)
+    reference = F.linear(inputs.float(), weight, bias)
+    torch.testing.assert_close(output, reference)
+    actual = torch.autograd.grad(output.square().sum(), (inputs, weight, bias))
+    expected = torch.autograd.grad(reference.square().sum(), (inputs, weight, bias))
+    for value, target in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, target)
+
+def test_layer_adam_preserves_native_weight_decay_overrides():
+    from megatron.core.optimizer import get_standard_config_overrides
+    from megatron.core.optimizer.optimizer_config import OptimizerConfig
+    from megatron.plugin.slideformer.layer_adam import LayerAdam
+    config = OptimizerConfig(lr=1e-2, weight_decay=0.1, apply_wd_to_qk_layernorm=True)
+    overrides = get_standard_config_overrides(config)
+    named = [("linear.weight", nn.Parameter(torch.ones(2, 2))),
+             ("linear.bias", nn.Parameter(torch.ones(2))),
+             ("q_layernorm.weight", nn.Parameter(torch.ones(2)))]
+    for name, param in named:
+        param._slideformer_wd_mult = 1.0
+        for key, override in overrides.items():
+            if key.matches(param, name):
+                param._slideformer_wd_mult = override.get("wd_mult", 1.0)
+    assert [p._slideformer_wd_mult for _, p in named] == [1.0, 0.0, 1.0]
+    optimizer = LayerAdam(lr=1e-2, weight_decay=0.1, num_layer=1)
+    optimizer.add_layer_params(0, [p for _, p in named])
+    optimizer.step_with_grad_views(0, {p: torch.zeros_like(p) for _, p in named})
+    for _, param in named:
+        expected = 1.0 - 1e-2 * 0.1 * param._slideformer_wd_mult
+        torch.testing.assert_close(param, torch.full_like(param, expected), rtol=0, atol=1e-7)
+
+
+def test_checkpoint_shape_validation_precedes_buffer_mutation():
+    from types import SimpleNamespace
+    model = nn.Module()
+    model.register_buffer("counter", torch.tensor(1.0))
+    param = nn.Parameter(torch.ones(2))
+    engine = object.__new__(MegatronSlideFormerEngine)
+    engine.model = model
+    engine.layer_optimizer = SimpleNamespace(exp_avg_flat={}, exp_avg_sq_flat={})
+    engine.managed_layers = [SimpleNamespace(params=[param], cpu_params={param: param.detach().clone()})]
+    state = {"buffers": {"counter": torch.tensor(5.0)},
+             "layers": [{"cpu_params": [torch.ones(3)]}]}
+    with pytest.raises(ValueError, match="parameter shape mismatch"):
+        engine.load_state_dict(state)
+    assert model.counter.item() == 1.0
+    torch.testing.assert_close(engine.managed_layers[0].cpu_params[param], torch.ones(2))

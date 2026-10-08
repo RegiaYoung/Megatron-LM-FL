@@ -43,8 +43,9 @@ import logging
 import math
 import os
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Dict
 
 import torch.distributed
@@ -282,6 +283,7 @@ def _validate_slideformer_runtime(slideformer_config: MegatronSlideFormerConfig 
         pipeline_model_parallel_size=mpu.get_pipeline_model_parallel_world_size(),
         data_parallel_size=mpu.get_data_parallel_world_size(),
         expert_model_parallel_size=getattr(args, "expert_model_parallel_size", 1),
+        context_parallel_size=getattr(args, "context_parallel_size", 1),
         num_microbatches=get_num_microbatches(),
         recompute_granularity=getattr(args, "recompute_granularity", None),
         recompute_method=getattr(args, "recompute_method", None),
@@ -292,62 +294,103 @@ def _apply_slideformer_if_enabled(model):
     slideformer_config = _get_slideformer_config()
     if not slideformer_config.enable:
         return None
+    gpu_gradient_pipeline_enabled = os.environ.get(
+        "MEGATRON_SLIDEFORMER_GPU_GRADIENT_PIPELINE", "1"
+    ).lower() not in {"0", "false", "no", "off"}
     _validate_slideformer_runtime(slideformer_config)
-    if len(model) != 1:
-        raise ValueError("Megatron-LM-FL SlideFormer currently supports one model chunk only")
-    kernel_report = apply_kernel_policy(model[0], slideformer_config, runtime_args=get_args())
-    engine = apply_true_megatron_slideformer(
-        model[0],
-        config=MegatronSlideFormerEngineConfig(
-            lr=get_args().lr,
-            betas=(get_args().adam_beta1, get_args().adam_beta2),
-            eps=get_args().adam_eps,
-            weight_decay=get_args().weight_decay,
-            activation_offload=slideformer_config.activation_offload,
-            offload_after_forward=slideformer_config.activation_offload,
-            prefetch=slideformer_config.param_prefetch,
-            window_size=slideformer_config.window_size,
-            chunk_size_mb=slideformer_config.chunk_size_mb,
-            nvme_offload_fraction=slideformer_config.nvme_offload_fraction,
-            offload_dir=slideformer_config.offload_dir or "./slideformer_offload",
-            double_buffer=slideformer_config.double_buffer,
-            gpu_buffer_count=slideformer_config.gpu_buffer_count,
-            activation_backend=slideformer_config.activation_backend,
-            activation_slot_prefetch=slideformer_config.activation_slot_prefetch,
-            activation_slot_gpu_window=slideformer_config.activation_slot_gpu_window,
-            unified_h2d_scheduler=slideformer_config.unified_h2d_scheduler,
-            max_outstanding_h2d=slideformer_config.max_outstanding_h2d,
-            activation_offload_min_numel=slideformer_config.activation_offload_min_numel,
-            activation_offload_max_dim=slideformer_config.activation_offload_max_dim,
-            activation_offload_max_tensors_per_layer=slideformer_config.activation_offload_max_tensors_per_layer,
-            overlap_grad_d2h_cpu_adam=slideformer_config.overlap_grad_d2h_cpu_adam,
-            optimizer_pipeline_depth=slideformer_config.optimizer_pipeline_depth,
-            optimizer_worker_count=slideformer_config.optimizer_worker_count,
-            cpu_adam_per_layer_optimizer=slideformer_config.cpu_adam_per_layer_optimizer,
-            shared_cpu_buffers=slideformer_config.shared_cpu_buffers,
-            cpu_grad_buffer_count=slideformer_config.cpu_grad_buffer_count,
-            cpu_param_staging_buffer_count=slideformer_config.cpu_param_staging_buffer_count,
-            te_fused_main_grad=slideformer_config.te_fused_main_grad,
-            fp32_master_params=slideformer_config.fp32_master_params,
-            qkv_layout_backend=(
-                slideformer_config.qkv_layout_backend
-                if slideformer_config.kernel_policy != "off"
-                and not (
-                    slideformer_config.qkv_layout_backend == "auto"
-                    and slideformer_config.attention_backend == "megatron"
-                )
-                else "megatron"
+    engines = []
+    kernel_reports = []
+    for chunk_id, model_chunk in enumerate(model):
+        kernel_report = apply_kernel_policy(model_chunk, slideformer_config, runtime_args=get_args())
+        engine = apply_true_megatron_slideformer(
+            model_chunk,
+            checkpoint_namespace=f"chunk_{chunk_id:03d}",
+            config=MegatronSlideFormerEngineConfig(
+                defer_optimizer_step=(
+                    torch.distributed.get_world_size() > 1
+                    or get_num_microbatches() > 1
+                    or gpu_gradient_pipeline_enabled
+                ),
+                lr=get_args().lr,
+                betas=(get_args().adam_beta1, get_args().adam_beta2),
+                eps=get_args().adam_eps,
+                weight_decay=get_args().weight_decay,
+                activation_offload=slideformer_config.activation_offload,
+                offload_after_forward=slideformer_config.activation_offload,
+                prefetch=slideformer_config.param_prefetch,
+                window_size=1,
+                chunk_size_mb=slideformer_config.chunk_size_mb,
+                nvme_offload_fraction=slideformer_config.nvme_offload_fraction,
+                offload_dir=slideformer_config.offload_dir or "./slideformer_offload",
+                double_buffer=slideformer_config.double_buffer,
+                gpu_buffer_count=slideformer_config.gpu_buffer_count,
+                activation_backend=slideformer_config.activation_backend,
+                activation_slot_prefetch=slideformer_config.activation_slot_prefetch,
+                activation_slot_gpu_window=slideformer_config.activation_slot_gpu_window,
+                unified_h2d_scheduler=slideformer_config.unified_h2d_scheduler,
+                max_outstanding_h2d=slideformer_config.max_outstanding_h2d,
+                activation_offload_min_numel=slideformer_config.activation_offload_min_numel,
+                activation_offload_max_dim=slideformer_config.activation_offload_max_dim,
+                activation_offload_max_tensors_per_layer=(
+                    slideformer_config.activation_offload_max_tensors_per_layer
+                ),
+                overlap_grad_d2h_cpu_adam=slideformer_config.overlap_grad_d2h_cpu_adam,
+                optimizer_pipeline_depth=slideformer_config.optimizer_pipeline_depth,
+                optimizer_worker_count=slideformer_config.optimizer_worker_count,
+                cpu_adam_per_layer_optimizer=slideformer_config.cpu_adam_per_layer_optimizer,
+                shared_cpu_buffers=slideformer_config.shared_cpu_buffers,
+                cpu_grad_buffer_count=slideformer_config.cpu_grad_buffer_count,
+                cpu_param_staging_buffer_count=(
+                    slideformer_config.cpu_param_staging_buffer_count
+                ),
+                te_fused_main_grad=slideformer_config.te_fused_main_grad,
+                flat_grad_d2h=gpu_gradient_pipeline_enabled,
+                fp32_master_params=slideformer_config.fp32_master_params,
+                qkv_layout_backend=(
+                    slideformer_config.qkv_layout_backend
+                    if slideformer_config.kernel_policy != "off"
+                    and mpu.get_tensor_model_parallel_world_size() == 1
+                    and getattr(get_args(), "context_parallel_size", 1) == 1
+                    and not (
+                        slideformer_config.qkv_layout_backend == "auto"
+                        and slideformer_config.attention_backend == "megatron"
+                    )
+                    else "megatron"
+                ),
             ),
-        ),
-    )
+        )
+        if gpu_gradient_pipeline_enabled:
+            from megatron.plugin.slideformer.gpu_gradient_pipeline import GPUGradientPipeline
+
+            pipeline = GPUGradientPipeline(
+                engine,
+                mpu.get_data_parallel_group(with_context_parallel=True),
+                mpu.get_tensor_model_parallel_group(),
+                expert_replica_group=mpu.get_expert_data_parallel_group(),
+                expert_tp_group=mpu.get_expert_tensor_parallel_group(),
+                pp_group=mpu.get_pipeline_model_parallel_group(),
+                model_chunk_id=chunk_id,
+            )
+            engine.gpu_gradient_pipeline = pipeline
+            for owner in engine.managed_layers:
+                owner.gpu_gradient_pipeline = pipeline
+        model_chunk._megatron_slideformer_engine = engine
+        engines.append(engine)
+        kernel_reports.append(kernel_report)
     print_rank_0(
-        "Megatron-LM-FL SlideFormer true engine enabled; kernel report: "
-        + json.dumps(kernel_report, sort_keys=True)
+        "Megatron-LM-FL SlideFormer engines enabled; kernel reports: "
+        + json.dumps(kernel_reports, sort_keys=True)
     )
-    return engine
+    return engines
 
 
 def _attach_slideformer_raw_model_grad_sync_shims(model_module):
+    if not hasattr(model_module, "ddp_config"):
+        model_module.ddp_config = SimpleNamespace(
+            use_megatron_fsdp=False,
+            use_distributed_optimizer=False,
+        )
+
     def finish_grad_sync(*args, **kwargs):
         return None
 
@@ -375,6 +418,80 @@ def _attach_slideformer_raw_model_grad_sync_shims(model_module):
     setattr(model_module, "zero_grad_buffer", zero_grad_buffer)
 
 
+def _finalize_slideformer_or_native_grads(model, num_tokens=None, pg_collection=None,
+                                         force_all_reduce=False):
+    engines = [
+        getattr(model_chunk, "_megatron_slideformer_engine", None)
+        for model_chunk in model
+    ]
+    if not any(engines) or any(
+        engine is None or not engine.config.defer_optimizer_step for engine in engines
+    ):
+        return finalize_model_grads(model, num_tokens, pg_collection, force_all_reduce)
+    group = (pg_collection.dp_cp if pg_collection is not None
+             else mpu.get_data_parallel_group(with_context_parallel=True))
+    tp_group = (pg_collection.tp if pg_collection is not None
+                else mpu.get_tensor_model_parallel_group())
+    expert_group = (
+        pg_collection.expt_dp
+        if pg_collection is not None and hasattr(pg_collection, "expt_dp")
+        else mpu.get_expert_data_parallel_group()
+    )
+    expert_tp_group = (
+        pg_collection.expt_tp
+        if pg_collection is not None and hasattr(pg_collection, "expt_tp")
+        else mpu.get_expert_tensor_parallel_group()
+    )
+    pp_group = (pg_collection.pp if pg_collection is not None and hasattr(pg_collection, "pp")
+                else mpu.get_pipeline_model_parallel_group())
+    for engine in engines:
+        engine.finalize_data_parallel_gradients(
+            group=group,
+            num_tokens=num_tokens,
+            tp_group=tp_group,
+            expert_group=expert_group,
+            expert_tp_group=expert_tp_group,
+            pp_group=pp_group,
+            defer_commit=True,
+        )
+
+    # Pipeline stages own distinct layer sets. Temporarily expose the reduced
+    # local shards so Megatron's native tied embedding collectives retain their
+    # exact PP semantics before CPUAdam consumes them.
+    if torch.distributed.get_world_size(pp_group) > 1:
+        from megatron.core.distributed.finalize_model_grads import (
+            _allreduce_conditional_embedding_grads,
+            _allreduce_position_embedding_grads,
+            _allreduce_word_embedding_grads,
+        )
+        embd_group = (
+            pg_collection.embd
+            if pg_collection is not None and hasattr(pg_collection, "embd")
+            else mpu.get_embedding_group()
+        )
+        pos_embd_group = (
+            pg_collection.pos_embd
+            if pg_collection is not None and hasattr(pg_collection, "pos_embd")
+            else mpu.get_position_embedding_group()
+        )
+        config = get_model_config(model[0])
+        with ExitStack() as stack:
+            for engine in engines:
+                stack.enter_context(engine.bind_pipeline_main_grads())
+            _allreduce_conditional_embedding_grads(model, config, pp_group)
+            _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
+            _allreduce_position_embedding_grads(model, config, pos_embd_group, pp_group)
+    from megatron.core.distributed.finalize_model_grads import (
+        _update_router_expert_bias, reset_model_temporary_tensors,
+    )
+    config = get_model_config(model[0])
+    if config.moe_router_enable_expert_bias:
+        _update_router_expert_bias(model, config)
+    reset_model_temporary_tensors(config, model)
+    for engine in engines:
+        engine.commit_pipeline_updates()
+
+
 def _model_has_slideformer_engine(model) -> bool:
     return any(
         getattr(model_chunk, "_megatron_slideformer_engine", None) is not None
@@ -382,12 +499,65 @@ def _model_has_slideformer_engine(model) -> bool:
     )
 
 
+class _SlideFormerOptimizerView:
+    """Expose every local model chunk's LayerAdam groups to one LR scheduler."""
+
+    def __init__(self, engines):
+        self.engines = list(engines)
+        self.param_groups = [
+            group
+            for engine in self.engines
+            for group in engine.layer_optimizer.param_groups
+        ]
+
+
 def _should_skip_native_checkpoint_for_slideformer(model, optimizer) -> bool:
     return optimizer is None and _model_has_slideformer_engine(model)
 
 
+def _save_final_checkpoint(
+    iteration, model, optimizer, opt_param_scheduler,
+    num_floating_point_operations_so_far, checkpointing_context,
+    train_data_iterator=None,
+):
+    """Keep end-of-training saves on the same ownership path as periodic saves."""
+    if _should_skip_native_checkpoint_for_slideformer(model, optimizer):
+        return save_checkpoint_and_time(
+            iteration, model, optimizer, opt_param_scheduler,
+            num_floating_point_operations_so_far, checkpointing_context,
+            train_data_iterator=train_data_iterator,
+        )
+    return save_checkpoint(
+        iteration, model, optimizer, opt_param_scheduler,
+        num_floating_point_operations_so_far, checkpointing_context,
+        train_data_iterator=train_data_iterator,
+        preprocess_common_state_dict_fn=preprocess_common_state_dict,
+    )
+
+
 def _slideformer_checkpoint_exists(load_dir) -> bool:
-    return load_dir is not None and (Path(load_dir) / "slideformer" / "latest.pt").exists()
+    if load_dir is None:
+        return False
+    root = Path(load_dir) / "slideformer"
+    args = get_args()
+    rank_root = root / f"rank_{torch.distributed.get_rank():05d}"
+    chunk_latest = rank_root / "chunk_000" / "latest.pt"
+    unsharded_chunk_latest = root / "chunk_000" / "latest.pt"
+    legacy_dense = all(getattr(args, name, 1) == 1 for name in (
+        "tensor_model_parallel_size", "pipeline_model_parallel_size",
+        "context_parallel_size", "expert_model_parallel_size",
+    ))
+    available = (
+        chunk_latest.exists()
+        or unsharded_chunk_latest.exists()
+        or (legacy_dense and (root / "latest.pt").exists())
+    )
+    availability = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(availability, available)
+    if any(availability) and not all(availability):
+        missing = [rank for rank, exists in enumerate(availability) if not exists]
+        raise FileNotFoundError(f"SlideFormer checkpoint shards missing on ranks {missing}")
+    return all(availability)
 
 
 def _get_loaded_slideformer_iteration(model) -> int:
@@ -1449,7 +1619,7 @@ def pretrain(
         print_datetime('after training is done')
 
         if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
-            save_checkpoint(
+            _save_final_checkpoint(
                 iteration,
                 model,
                 optimizer,
@@ -1457,7 +1627,6 @@ def pretrain(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
-                preprocess_common_state_dict_fn=preprocess_common_state_dict,
             )
 
         one_logger and one_logger.log_metrics(
@@ -1883,16 +2052,29 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not skip_optimizer and not slideformer_config.enable
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
-    slideformer_engine = _apply_slideformer_if_enabled(model)
+    slideformer_engines = _apply_slideformer_if_enabled(model)
+    if slideformer_engines is not None:
+        if getattr(args, "decoupled_lr", None) is not None or getattr(args, "use_mup", False):
+            raise NotImplementedError(
+                "SlideFormer does not yet support decoupled LR or MuP optimizer schedules"
+            )
+        native_config, native_overrides = get_megatron_optimizer_config(args)
+        # Preserve native no-decay/QK-layernorm rules while retaining sliding's
+        # owner-based optimizer state layout and common learning-rate schedule.
+        for chunk in unwrapped_model:
+            for name, param in chunk.named_parameters():
+                param._slideformer_wd_mult = 1.0
+                for key, override in native_overrides.items():
+                    if key.matches(param, name) and "wd_mult" in override:
+                        param._slideformer_wd_mult = override["wd_mult"]
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
         optimizer, opt_param_scheduler = None, None
-        if slideformer_engine is not None:
-            model[0]._megatron_slideformer_engine = slideformer_engine
+        if slideformer_engines is not None:
             if not args.skip_train:
                 opt_param_scheduler = get_optimizer_param_scheduler(
-                    slideformer_engine.layer_optimizer
+                    _SlideFormerOptimizerView(slideformer_engines)
                 )
         # In RL inference-only mode, train_iters must still be set despite having no optimizer.
         if args.perform_rl_step:
@@ -1992,10 +2174,17 @@ def setup_model_and_optimizer(
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
         if slideformer_config.enable and _slideformer_checkpoint_exists(args.load):
-            loaded_iteration = slideformer_engine.load_checkpoint(
-                args.load, opt_param_scheduler=opt_param_scheduler
-            )
-            slideformer_engine._megatron_slideformer_loaded_iteration = loaded_iteration
+            loaded_iterations = []
+            for engine in slideformer_engines:
+                loaded_iteration = engine.load_checkpoint(
+                    args.load, opt_param_scheduler=opt_param_scheduler
+                )
+                engine._megatron_slideformer_loaded_iteration = loaded_iteration
+                loaded_iterations.append(loaded_iteration)
+            if len(set(loaded_iterations)) != 1:
+                raise ValueError(
+                    f"SlideFormer model chunks restored different iterations: {loaded_iterations}"
+                )
             args.iteration = _get_loaded_slideformer_iteration(model)
             args.num_floating_point_operations_so_far = 0
             print_rank_0(
@@ -2096,7 +2285,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             for model_chunk in model:
                 engine = getattr(model_chunk, "_megatron_slideformer_engine", None)
                 if engine is not None:
-                    engine.zero_unmanaged_grads()
+                    engine.zero_unmanaged_grads(num_microbatches=get_num_microbatches())
 
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
@@ -2185,7 +2374,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             engine = getattr(model_chunk, "_megatron_slideformer_engine", None)
             if engine is not None:
                 engine.step_unmanaged_params()
-        update_successful, grad_norm, num_zeros_in_grad = True, None, 0
+        engines = [getattr(chunk, "_megatron_slideformer_engine", None) for chunk in model]
+        update_successful = all(e.last_update_successful for e in engines if e is not None)
+        grad_norm = None
+        num_zeros_in_grad = 0
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
@@ -2672,7 +2864,9 @@ def save_checkpoint_and_time(
         saved_paths = []
         for model_chunk in model:
             engine = getattr(model_chunk, "_megatron_slideformer_engine", None)
-            if engine is not None and args.save:
+            if engine is not None and args.save and (
+                torch.distributed.get_rank() == 0 or engine.sharded_checkpoint
+            ):
                 saved_paths.append(
                     engine.save_checkpoint(
                         args.save,
@@ -3091,7 +3285,7 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    config.finalize_model_grads_func = _finalize_slideformer_or_native_grads
 
     if args.log_energy:
         energy_monitor.setup()

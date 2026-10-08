@@ -221,6 +221,7 @@ class MegatronSlideFormerConfig:
         pipeline_model_parallel_size: int,
         data_parallel_size: int = 1,
         expert_model_parallel_size: int = 1,
+        context_parallel_size: int = 1,
         num_microbatches: int = 1,
         recompute_granularity: str | None = None,
         recompute_method: str | None = None,
@@ -229,18 +230,18 @@ class MegatronSlideFormerConfig:
             return
         if self.mode != "true_slideformer":
             raise ValueError("Megatron-LM-FL SlideFormer currently supports mode=true_slideformer")
-        if tensor_model_parallel_size != 1:
-            raise ValueError("Megatron-LM-FL SlideFormer currently supports TP=1 only")
-        if pipeline_model_parallel_size != 1:
-            raise ValueError("Megatron-LM-FL SlideFormer currently supports PP=1 only")
-        if data_parallel_size != 1:
-            raise ValueError("Megatron-LM-FL SlideFormer currently supports DP=1 only")
-        if expert_model_parallel_size != 1:
-            raise ValueError("Megatron-LM-FL SlideFormer currently supports EP=1 only")
-        if num_microbatches != 1:
-            raise ValueError(
-                "Megatron-LM-FL SlideFormer currently supports num_microbatches=1 only"
-            )
+        if tensor_model_parallel_size < 1:
+            raise ValueError("SlideFormer tensor_model_parallel_size must be positive")
+        if pipeline_model_parallel_size < 1:
+            raise ValueError("SlideFormer pipeline_model_parallel_size must be positive")
+        if data_parallel_size < 1:
+            raise ValueError("SlideFormer data_parallel_size must be positive")
+        if context_parallel_size < 1:
+            raise ValueError("SlideFormer context_parallel_size must be positive")
+        if expert_model_parallel_size < 1:
+            raise ValueError("SlideFormer expert_model_parallel_size must be positive")
+        if num_microbatches < 1:
+            raise ValueError("SlideFormer num_microbatches must be positive")
         if recompute_granularity is not None or recompute_method is not None:
             raise ValueError(
                 "Megatron-LM-FL SlideFormer activation offload/checkpointing is incompatible "

@@ -746,6 +746,10 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
+        # Native vocab CE mutates FP32 logits; full backward hooks return views.
+        if logits.dtype == torch.float32 and hasattr(self, "_megatron_slideformer_engine"):
+            logits = logits.clone()
+
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss

@@ -26,6 +26,9 @@ from megatron.plugin.slideformer.kernels import (
     restore_tp1_batch_major_attention,
 )
 from megatron.plugin.slideformer.layer_adam import LayerAdam
+from megatron.plugin.slideformer.distributed import (
+    synchronize_gradient,
+)
 from megatron.plugin.slideformer.layout import (
     MegatronDecoderLayout,
     assert_trainable_parameter_coverage,
@@ -57,6 +60,7 @@ class _CheckpointBackwardBoundary(torch.autograd.Function):
 
 @dataclass(frozen=True)
 class MegatronSlideFormerEngineConfig:
+    defer_optimizer_step: bool = False
     lr: float = 1e-5
     bias_correction: bool = True
     betas: tuple[float, float] = (0.9, 0.999)
@@ -618,7 +622,8 @@ class _ManagedLayer:
             else [param for param in layer.parameters(recurse=True) if param.requires_grad]
         )
         self._te_fused_params: set[nn.Parameter] = set()
-        if self.config.te_fused_main_grad and self.is_transformer_layer:
+        if (self.config.te_fused_main_grad and self.is_transformer_layer
+            and len({param.dtype for param in self.params}) == 1):
             param_ids = {id(param): param for param in self.params}
             for module in self.layer.modules():
                 if not hasattr(module, "fuse_wgrad_accumulation"):
@@ -632,6 +637,11 @@ class _ManagedLayer:
                         # TE snapshots this flag during forward, before the
                         # engine leases a gradient slot for backward.
                         fused_param.overwrite_main_grad = True
+                        # Match native DDP's hook trigger contract: TE otherwise
+                        # returns no autograd weight gradient, so readiness can
+                        # be reported before the fused wgrad has completed.
+                        fused_param.grad_added_to_main_grad = False
+                        fused_param.zero_out_wgrad = True
                 module.fuse_wgrad_accumulation = True
         self._param_expected_accumulations = {
             param: int(getattr(param, "_slideformer_expected_grad_accumulations", 1))
@@ -888,6 +898,9 @@ class _ManagedLayer:
         self._gpu_grad_pool_slot = slot
         assert self.cpu_grad_flat is not None
         self.gpu_grad_flat = tensor[: self.cpu_grad_flat.numel()]
+        # Recomputed TE forwards may accumulate even for the first local
+        # backward. A leased slot contains another owner's old gradients.
+        self.gpu_grad_flat.zero_()
         for param in self._te_fused_params:
             start, end = self._param_flat_offsets[param]
             param.main_grad = self.gpu_grad_flat[start:end].view_as(param)
@@ -1020,7 +1033,8 @@ class _ManagedLayer:
                         request_id=self.prefetch_request_id,
                     )
                 else:
-                    torch.cuda.current_stream(self.device).wait_stream(self.h2d_stream)
+                    # Wait only for this owner, not all future prefetches.
+                    torch.cuda.current_stream(self.device).wait_event(self.prefetch_event)
             self._record_lifecycle(
                 "param_prefetch_complete", param_h2d_bytes=self._param_h2d_bytes()
             )
@@ -1117,9 +1131,8 @@ class _ManagedLayer:
                 self._copy_tensor(gpu_param, self.cpu_execution_params[param])
                 param.data = gpu_param
                 param.grad = None
-            if self.h2d_scheduler is not None or self.cpu_param_staging_pool is not None:
-                self.prefetch_event = torch.cuda.Event()
-                self.prefetch_event.record(h2d_stream)
+            self.prefetch_event = torch.cuda.Event()
+            self.prefetch_event.record(h2d_stream)
             if self.h2d_scheduler is not None:
                 self.prefetch_request_id = request_id
         self._release_execution_staging(self.prefetch_event)
@@ -1258,7 +1271,7 @@ class _ManagedLayer:
     def _submit_grad_copy(self, param: nn.Parameter, grad: torch.Tensor) -> None:
         if self.config.skip_grad_d2h:
             return
-        source = grad.detach()
+        source = (param.main_grad if param in self._te_fused_params else grad).detach()
         if self.traffic_counters is not None:
             bytes_ = int(source.numel() * source.element_size())
             self.traffic_counters["grad_d2h_bytes"] = (
@@ -1288,6 +1301,10 @@ class _ManagedLayer:
         return self.gpu_grad_flat
 
     def _stage_param_grad_to_flat(self, param: nn.Parameter, grad: torch.Tensor) -> None:
+        if param in self._te_fused_params:
+            # TE already wrote the real gradient into this flat main_grad view.
+            # Its autograd gradient is only a hook trigger and must not overwrite it.
+            return
         gpu_grad_flat = self._ensure_gpu_grad_flat()
         start, end = self._param_flat_offsets[param]
         current_stream = torch.cuda.current_stream(self.device)
@@ -1300,6 +1317,8 @@ class _ManagedLayer:
                 source.record_stream(self.d2h_stream)
 
     def _submit_layer_grad_copy(self) -> None:
+        if getattr(self, "gpu_gradient_pipeline", None) is not None:
+            return
         if not self._flat_grad_copy_supported or self.cpu_grad_flat is None:
             return
         gpu_grad_flat = self._ensure_gpu_grad_flat()
@@ -1451,10 +1470,12 @@ class MegatronSlideFormerEngine:
         device: torch.device,
         config: MegatronSlideFormerEngineConfig | None = None,
         layout: MegatronDecoderLayout | None = None,
+        checkpoint_namespace: str | None = None,
     ) -> None:
         self.model = model
         self.device = device
         self.config = config or MegatronSlideFormerEngineConfig()
+        self.checkpoint_namespace = checkpoint_namespace
         self._closed = False
         self.layout = layout or resolve_megatron_decoder_layout(model)
         assert_trainable_parameter_coverage(model, self.layout)
@@ -1479,6 +1500,7 @@ class MegatronSlideFormerEngine:
         # path synchronous until its read/write dependencies are pipelined too.
         self._async_optimizer_enabled = bool(
             self.config.overlap_grad_d2h_cpu_adam
+            and not self.config.defer_optimizer_step
             and self.config.nvme_offload_fraction == 0.0
             and (not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1)
         )
@@ -1581,6 +1603,10 @@ class MegatronSlideFormerEngine:
         if self.config.activation_offload:
             self._wrap_activation_offload_forwards()
         self._ready_backward_layers: set[int] = set()
+        self.gpu_gradient_pipeline = None
+        self._accumulated_grads: dict[int, dict[nn.Parameter, torch.Tensor]] = {}
+        self._gradients_finalized = False
+        self.last_update_successful = True
         self._hook_handles: list[Any] = []
         self._register_hooks()
 
@@ -1925,13 +1951,12 @@ class MegatronSlideFormerEngine:
             layer_owner = self.managed_layers[idx]
             layer_owner._record_lifecycle("forward_start")
             in_backward_recompute = layer_owner._pending_backward_step
+            # Demand first: future owners must not consume the current slot.
+            layer_owner.load_params()
             if self.config.prefetch and not in_backward_recompute:
                 with _TimedBlock(self.timing, "forward_prefetch_window"):
-                    for next_idx in range(
-                        idx + 1, min(idx + 1 + self.config.window_size, len(self.managed_layers))
-                    ):
-                        self.managed_layers[next_idx].prefetch_params()
-            layer_owner.load_params()
+                    if idx + 1 < len(self.managed_layers):
+                        self.managed_layers[idx + 1].prefetch_params()
             if self.timing is not None:
                 layer_owner._forward_compute_start = time.perf_counter()
             # Megatron deliberately keeps tensors such as RoPE frequencies in
@@ -1957,20 +1982,19 @@ class MegatronSlideFormerEngine:
                 self.config.offload_after_forward
                 and not self.managed_layers[idx]._pending_backward_step
             ):
-                offload_idx = idx - max(self.config.window_size, 1) + 1
-                if offload_idx >= 0:
-                    self.managed_layers[offload_idx].offload_params()
+                # Lookahead does not extend past-layer residency.
+                self.managed_layers[idx].offload_params()
             return output
 
         return hook
 
     def _make_backward_pre_hook(self, idx: int):
         def hook(module: nn.Module, grad_output: tuple[Any, ...]) -> None:
+            self.managed_layers[idx].load_params()
             if self.config.prefetch:
                 with _TimedBlock(self.timing, "backward_prefetch_window"):
-                    for prev_idx in range(max(idx - self.config.window_size, 0), idx):
-                        self.managed_layers[prev_idx].prefetch_params()
-            self.managed_layers[idx].load_params()
+                    if idx > 0:
+                        self.managed_layers[idx - 1].prefetch_params()
             self.managed_layers[idx].mark_backward_pending()
             if self.timing is not None:
                 self.managed_layers[idx]._backward_compute_start = time.perf_counter()
@@ -2000,6 +2024,40 @@ class MegatronSlideFormerEngine:
         self._transformer_owner_by_module_id[id(module)].mark_module_backward_done()
 
     def _mark_layer_backward_ready(self, layer_owner: _ManagedLayer) -> None:
+        if self.gpu_gradient_pipeline is not None:
+            self.gpu_gradient_pipeline.capture(layer_owner)
+            layer_owner.offload_params(force=True)
+            layer_owner._release_grad_buffer()
+            layer_owner._pending_backward_step = False
+            layer_owner._module_backward_done = False
+            layer_owner._backward_ready_reported = False
+            layer_owner._grad_seen.clear()
+            layer_owner._param_accumulation_counts.clear()
+            layer_owner._grad_copy_submitted = False
+            return
+        if self.config.defer_optimizer_step:
+            # The pooled D2H buffer belongs to the next layer immediately after
+            # release. Keep a distinct FP32 CPU accumulator until all microbatches
+            # and replica reductions have finished; never update from a hook.
+            layer_owner._wait_for_grad_copies()
+            gradients = self._accumulated_grads.setdefault(layer_owner.layer_idx, {})
+            for param in layer_owner.params:
+                if param not in layer_owner._grad_seen or self.config.skip_grad_d2h:
+                    continue
+                source = layer_owner.cpu_grads[param]
+                if param in gradients:
+                    gradients[param].add_(source)
+                else:
+                    gradients[param] = source.float().clone()
+            layer_owner.offload_params(force=True)
+            layer_owner._release_grad_buffer()
+            layer_owner._pending_backward_step = False
+            layer_owner._module_backward_done = False
+            layer_owner._backward_ready_reported = False
+            layer_owner._grad_seen.clear()
+            layer_owner._param_accumulation_counts.clear()
+            layer_owner._grad_copy_submitted = False
+            return
         if not self._async_optimizer_enabled:
             layer_owner.offload_grads_and_step()
             return
@@ -2056,6 +2114,10 @@ class MegatronSlideFormerEngine:
         self.wait_for_completion()
         return {
             "layer_optimizer": self.layer_optimizer.state_dict(),
+            "buffers": {
+                name: value.detach().cpu().clone()
+                for name, value in self.model.named_buffers()
+            },
             "layers": [
                 {
                     "step": owner.step,
@@ -2129,7 +2191,37 @@ class MegatronSlideFormerEngine:
                 owner.step = 0
             owner._refresh_execution_params()
 
+    def _validate_checkpoint_model_state(self, state_dict: dict[str, Any]) -> None:
+        """Validate all model tensors before modifying live weights or buffers."""
+        buffers = dict(self.model.named_buffers())
+        for name, value in state_dict.get("buffers", {}).items():
+            if name not in buffers or buffers[name].shape != value.shape:
+                raise ValueError(f"SlideFormer checkpoint buffer mismatch: {name}")
+        layers = state_dict.get("layers", [])
+        if len(layers) != len(self.managed_layers):
+            raise ValueError("SlideFormer checkpoint layer count mismatch")
+        for owner, layer_state in zip(self.managed_layers, layers, strict=True):
+            cpu_params = layer_state.get("cpu_params", [])
+            if len(cpu_params) != len(owner.params):
+                raise ValueError("SlideFormer checkpoint parameter count mismatch")
+            for param, source in zip(owner.params, cpu_params, strict=True):
+                if source.shape != owner.cpu_params[param].shape:
+                    raise ValueError("SlideFormer checkpoint parameter shape mismatch")
+
+        optimizer_state = state_dict.get("layer_optimizer", {})
+        for field in ("exp_avg_flat", "exp_avg_sq_flat"):
+            target = getattr(self.layer_optimizer, field)
+            for layer_idx, source in optimizer_state.get(field, {}).items():
+                if layer_idx not in target or source.shape != target[layer_idx].shape:
+                    raise ValueError(f"SlideFormer checkpoint optimizer shape mismatch: {field}[{layer_idx}]")
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._validate_checkpoint_model_state(state_dict)
+        buffers = dict(self.model.named_buffers())
+        for name, value in state_dict.get("buffers", {}).items():
+            if name not in buffers or buffers[name].shape != value.shape:
+                raise ValueError(f"SlideFormer checkpoint buffer mismatch: {name}")
+            buffers[name].copy_(value.to(buffers[name].device))
         layers = state_dict.get("layers", [])
         if len(layers) != len(self.managed_layers):
             raise ValueError(
@@ -2142,6 +2234,8 @@ class MegatronSlideFormerEngine:
             if len(cpu_params) != len(owner.params):
                 raise ValueError("SlideFormer checkpoint parameter count mismatch")
             for param, source_param in zip(owner.params, cpu_params, strict=True):
+                if source_param.shape != owner.cpu_params[param].shape:
+                    raise ValueError("SlideFormer checkpoint parameter shape mismatch")
                 owner.cpu_params[param].copy_(
                     source_param.to(dtype=owner.cpu_params[param].dtype), non_blocking=False
                 )
@@ -2152,10 +2246,13 @@ class MegatronSlideFormerEngine:
     def save_checkpoint(
         self, checkpoint_dir: str | Path, iteration: int, opt_param_scheduler=None
     ) -> Path:
-        checkpoint_root = Path(checkpoint_dir) / "slideformer"
+        checkpoint_root = self._checkpoint_root(checkpoint_dir)
         checkpoint_root.mkdir(parents=True, exist_ok=True)
         state = {
-            "version": 2,
+            "version": 4,
+            "checkpoint_namespace": getattr(self, "checkpoint_namespace", None),
+            "parallel_topology": self._checkpoint_topology(),
+            "rng": self._checkpoint_rng(),
             "iteration": iteration,
             "engine": self.state_dict(),
             "opt_param_scheduler": (
@@ -2169,15 +2266,119 @@ class MegatronSlideFormerEngine:
         return path
 
     def load_checkpoint(self, checkpoint_dir: str | Path, opt_param_scheduler=None) -> int | None:
-        latest_path = Path(checkpoint_dir) / "slideformer" / "latest.pt"
-        if not latest_path.exists():
+        latest_path = self._checkpoint_root(checkpoint_dir) / "latest.pt"
+        config = getattr(self.layout.model, "config", None)
+        if (
+            not latest_path.exists()
+            and getattr(self, "checkpoint_namespace", None) in (None, "chunk_000")
+            and all(getattr(config, name, 1) == 1 for name in (
+                "tensor_model_parallel_size", "pipeline_model_parallel_size",
+                "context_parallel_size", "expert_model_parallel_size",
+            ))
+        ):
+            # Legacy dense DP checkpoints shared rank zero's weights and had no RNG.
+            latest_path = Path(checkpoint_dir) / "slideformer" / "latest.pt"
+        available = latest_path.exists()
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            availability = [None] * dist.get_world_size()
+            dist.all_gather_object(availability, available)
+            if any(availability) and not all(availability):
+                missing = [rank for rank, exists in enumerate(availability) if not exists]
+                raise FileNotFoundError(f"SlideFormer checkpoint shards missing on ranks {missing}")
+        if not available:
             return None
-        state = torch.load(latest_path, map_location="cpu", weights_only=False)
+        state = None
+        error = None
+        try:
+            state = torch.load(latest_path, map_location="cpu", weights_only=False)
+            saved_namespace = state.get("checkpoint_namespace")
+            current_namespace = getattr(self, "checkpoint_namespace", None)
+            if saved_namespace is not None and saved_namespace != current_namespace:
+                raise ValueError(
+                    "SlideFormer checkpoint model-chunk namespace mismatch: "
+                    f"{saved_namespace!r} != {current_namespace!r}"
+                )
+            topology = state.get("parallel_topology")
+            if topology is not None and topology != self._checkpoint_topology():
+                raise ValueError("SlideFormer checkpoint parallel topology mismatch")
+            self._validate_checkpoint_model_state(state["engine"])
+            iteration = int(state.get("iteration", 0))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            iteration = None
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            headers = [None] * dist.get_world_size()
+            dist.all_gather_object(headers, (iteration, error))
+            errors = {rank: header[1] for rank, header in enumerate(headers) if header[1]}
+            if errors:
+                raise ValueError(f"SlideFormer checkpoint validation failed: {errors}")
+            iterations = [header[0] for header in headers]
+            if len(set(iterations)) != 1:
+                raise ValueError(f"SlideFormer checkpoint iteration mismatch: {iterations}")
+        elif error is not None:
+            raise ValueError(error)
         self.load_state_dict(state["engine"])
         scheduler_state = state.get("opt_param_scheduler")
         if opt_param_scheduler is not None and scheduler_state is not None:
             opt_param_scheduler.load_state_dict(scheduler_state)
+        if state.get("rng") is not None:
+            self._restore_checkpoint_rng(state["rng"])
         return int(state.get("iteration", 0))
+
+    @property
+    def sharded_checkpoint(self) -> bool:
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            # DP replicas also have rank-local RNG state.
+            return True
+        config = getattr(self.layout.model, "config", None)
+        return any(getattr(config, name, 1) > 1 for name in (
+            "tensor_model_parallel_size", "context_parallel_size", "expert_model_parallel_size"
+        ))
+
+    def _checkpoint_rng(self) -> dict[str, Any]:
+        import random
+        import numpy as np
+        device = getattr(self, "device", None)
+        rng = {"python": random.getstate(), "numpy": np.random.get_state(),
+               "torch": torch.get_rng_state()}
+        if device is not None and device.type == "cuda":
+            from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+            rng["cuda"] = torch.cuda.get_rng_state(device)
+            rng["tracker"] = get_cuda_rng_tracker().get_states()
+        return rng
+
+    def _restore_checkpoint_rng(self, rng: dict[str, Any]) -> None:
+        import random
+        import numpy as np
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"])
+        if "cuda" in rng:
+            from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+            torch.cuda.set_rng_state(rng["cuda"], self.device)
+            get_cuda_rng_tracker().set_states(rng["tracker"])
+
+    def _checkpoint_topology(self) -> dict[str, int]:
+        config = getattr(self.layout.model, "config", None)
+        return {
+            name: int(getattr(config, name, 1)) for name in (
+                "tensor_model_parallel_size", "pipeline_model_parallel_size",
+                "context_parallel_size",
+                "expert_model_parallel_size", "expert_tensor_parallel_size",
+            )
+        } | {
+            "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+            "rank": dist.get_rank() if self.sharded_checkpoint else 0,
+        }
+
+    def _checkpoint_root(self, checkpoint_dir) -> Path:
+        root = Path(checkpoint_dir) / "slideformer"
+        if self.sharded_checkpoint:
+            root /= f"rank_{dist.get_rank():05d}"
+        checkpoint_namespace = getattr(self, "checkpoint_namespace", None)
+        if checkpoint_namespace:
+            root /= checkpoint_namespace
+        return root
 
     def step_unmanaged_params(self) -> None:
         """Update Megatron-owned trainable params not handled by layer offload.
@@ -2187,11 +2388,41 @@ class MegatronSlideFormerEngine:
         for future Megatron modules that expose extra trainable parameters.
         """
         self.wait_for_completion()
+        if self.config.defer_optimizer_step:
+            if not self._gradients_finalized:
+                raise RuntimeError("SlideFormer gradients must be finalized before CPU Adam")
+            if (
+                self.gpu_gradient_pipeline is None
+                and self.last_update_successful
+                and not self.config.skip_cpu_adam_step
+            ):
+                for owner in self.managed_layers:
+                    # Do not retain shared gradient-pool views across updates.
+                    original_grads = owner.cpu_grads
+                    owner.cpu_grads = self._accumulated_grads.get(owner.layer_idx, {})
+                    try:
+                        if owner.cpu_grads:
+                            owner._step_layer_optimizer()
+                    finally:
+                        owner.cpu_grads = original_grads
+            self._accumulated_grads.clear()
+            self._gradients_finalized = False
+            if self.gpu_gradient_pipeline is not None:
+                self.gpu_gradient_pipeline.consumed()
         if self.unmanaged_optimizer is None:
             return
         self.unmanaged_optimizer.step()
 
-    def zero_unmanaged_grads(self) -> None:
+    def zero_unmanaged_grads(self, num_microbatches=1) -> None:
+        if self.gpu_gradient_pipeline is not None:
+            model_config = getattr(self.layout.model, "config", None)
+            self.gpu_gradient_pipeline.begin(
+                num_microbatches,
+                per_token_loss=bool(getattr(model_config, "calculate_per_token_loss", False)),
+            )
+        if self.config.defer_optimizer_step:
+            self._accumulated_grads.clear()
+            self._gradients_finalized = False
         if self.unmanaged_optimizer is not None:
             self.unmanaged_optimizer.zero_grad(set_to_none=True)
         # Prime the first cache unit before the embedding forward, mirroring
@@ -2199,6 +2430,103 @@ class MegatronSlideFormerEngine:
         # queue one layer ahead in both directions.
         if self.config.prefetch and self.managed_layers:
             self.managed_layers[0].prefetch_params()
+
+    def finalize_data_parallel_gradients(self, *, group, num_tokens=None,
+                                        tp_group=None, expert_group=None, expert_tp_group=None,
+                                        pp_group=None, defer_commit=False) -> None:
+        """Finish dense/expert reductions and gradient scaling before CPU updates.
+
+        This conservative path retains FP32 gradients on CPU and uses bounded
+        GPU communication chunks. TP, CP, EP and PP remain gated separately.
+        """
+        if self._gradients_finalized:
+            raise RuntimeError("SlideFormer gradients were finalized twice")
+        if self.gpu_gradient_pipeline is not None:
+            self.gpu_gradient_pipeline.finalize_reductions(num_tokens, pp_group=pp_group)
+            if not defer_commit:
+                self.gpu_gradient_pipeline.commit_updates()
+            self.last_update_successful = True
+            self._gradients_finalized = True
+            return
+        if self.unmanaged_params:
+            raise ValueError("Deferred SlideFormer updates require full parameter coverage")
+        gradients = []
+        names = {id(param): name for name, param in self.model.named_parameters()}
+        model_config = getattr(self.layout.model, "config", None)
+        dp_size = dist.get_world_size(group) if group is not None else 1
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+        for owner in self.managed_layers:
+            owner_gradients = self._accumulated_grads.setdefault(owner.layer_idx, {})
+            for param in owner.params:
+                # Fixed parameter order includes locally unused parameters so
+                # replicas cannot issue different collective sequences.
+                grad = owner_gradients.setdefault(
+                    param, torch.zeros_like(owner.cpu_params[param], dtype=torch.float32)
+                )
+                is_expert = not getattr(param, "allreduce", True)
+                replica_group = expert_group if is_expert else group
+                synchronize_gradient(
+                    grad, group=replica_group, device=self.device,
+                    chunk_size_mb=self.config.chunk_size_mb,
+                    average=False,
+                )
+                if num_tokens is None:
+                    # Native DDP scales dense AND expert SUM reductions by
+                    # 1/dp_cp_size, even when expert replicas use a smaller group.
+                    grad.div_(dp_size)
+                gradients.append(grad)
+            if tp_size > 1:
+                # Reuse MCore's q/k norm, sequence-parallel and TP-average
+                # selection/reduction semantics. Only the selected gradients
+                # of the current owner reside on GPU during this operation.
+                from megatron.core.distributed.finalize_model_grads import (
+                    _allreduce_non_tensor_model_parallel_grads,
+                )
+                selected = []
+                saved_main_grads = {}
+                for param, grad in owner_gradients.items():
+                    name = names[id(param)]
+                    if (getattr(param, "average_gradients_across_tp_domain", False)
+                        or (getattr(model_config, "sequence_parallel", False)
+                            and getattr(param, "sequence_parallel", False))
+                        or (getattr(model_config, "qk_layernorm", False)
+                            and ("q_layernorm" in name or "k_layernorm" in name))):
+                        saved_main_grads[param] = getattr(param, "main_grad", None)
+                        param.main_grad = grad.to(self.device)
+                        selected.append((name, param))
+                adapter = SimpleNamespace(
+                    ddp_config=SimpleNamespace(use_megatron_fsdp=False),
+                    named_parameters=lambda: iter(selected),
+                )
+                try:
+                    _allreduce_non_tensor_model_parallel_grads([adapter], model_config, tp_group)
+                    for _, param in selected:
+                        owner_gradients[param].copy_(param.main_grad.cpu())
+                finally:
+                    for _, param in selected:
+                        param.main_grad = saved_main_grads[param]
+        scale = 1.0
+        if num_tokens is not None:
+            total_tokens = num_tokens.detach().clone()
+            if group is not None and dist.get_world_size(group) > 1:
+                dist.all_reduce(total_tokens, group=group)
+            if total_tokens.item() > 0:
+                scale = 1.0 / total_tokens.item()
+        for gradient in gradients:
+            gradient.mul_(scale)
+        self.last_update_successful = True
+        self._gradients_finalized = True
+
+    def bind_pipeline_main_grads(self):
+        """Temporarily expose pipeline buffers to Megatron PP embedding collectives."""
+        if self.gpu_gradient_pipeline is None:
+            from contextlib import nullcontext
+            return nullcontext()
+        return self.gpu_gradient_pipeline.bind_main_grads()
+
+    def commit_pipeline_updates(self) -> None:
+        if self.gpu_gradient_pipeline is not None:
+            self.gpu_gradient_pipeline.commit_updates()
 
     def timing_summary(self) -> dict[str, Any]:
         if self.timing is None:
@@ -2320,6 +2648,10 @@ class MegatronSlideFormerEngine:
                     if owner.cpu_grad_pool is None
                     for tensor in owner.cpu_grads.values()
                 ),
+            ],
+            "accumulated_gradients": [
+                tensor for owner_grads in self._accumulated_grads.values()
+                for tensor in owner_grads.values()
             ],
             "execution_parameter_staging": [
                 *(
@@ -2462,6 +2794,8 @@ class MegatronSlideFormerEngine:
             self.wait_for_completion()
         except BaseException as exc:
             completion_error = exc
+        if self.gpu_gradient_pipeline is not None:
+            self.gpu_gradient_pipeline.close()
         if self._optimizer_queue is not None and self._optimizer_workers:
             for _ in self._optimizer_workers:
                 self._optimizer_queue.put(None)
@@ -2523,9 +2857,15 @@ def apply_true_megatron_slideformer(
     *,
     device: torch.device | None = None,
     config: MegatronSlideFormerEngineConfig | None = None,
+    checkpoint_namespace: str | None = None,
 ) -> MegatronSlideFormerEngine:
     device = device or torch.device("cuda", torch.cuda.current_device())
-    engine = MegatronSlideFormerEngine(model, device=device, config=config)
+    engine = MegatronSlideFormerEngine(
+        model,
+        device=device,
+        config=config,
+        checkpoint_namespace=checkpoint_namespace,
+    )
     registration_modules = [model]
     if engine.layout.model is not model:
         registration_modules.append(engine.layout.model)

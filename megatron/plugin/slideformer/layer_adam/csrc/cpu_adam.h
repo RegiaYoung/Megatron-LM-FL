@@ -56,23 +56,13 @@ public:
     STEP(8)
     inline void IncrementStep(size_t step, float beta1, float beta2)
     {
-        if (beta1 != _betta1 || beta2 != _betta2) {
-            _step = step;
-            _betta1 = beta1;
-            _betta2 = beta2;
-            _betta1_t = std::pow(_betta1, step);
-            _betta2_t = std::pow(_betta2, step);
-        } else {
-            _step++;
-            if (_step != step) {
-                _betta1_t = std::pow(_betta1, step);
-                _betta2_t = std::pow(_betta2, step);
-                _step = step;
-            } else {
-                _betta1_t *= _betta1;
-                _betta2_t *= _betta2;
-            }
-        }
+        // Derive bias correction from the explicit checkpointed step. Repeated
+        // parameter updates at the same step and resumed updates must agree.
+        _step = step;
+        _betta1 = beta1;
+        _betta2 = beta2;
+        _betta1_t = std::pow(_betta1, step);
+        _betta2_t = std::pow(_betta2, step);
     }
     inline void update_state(float lr, float epsilon, float weight_decay, bool bias_correction)
     {
